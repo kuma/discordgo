@@ -102,11 +102,16 @@ func decodeULEB128(data []byte) (value uint32, n int, err error) {
 	return 0, 0, fmt.Errorf("ULEB128 unterminated")
 }
 
-// decryptSecureFrame parses a DAVE SecureFrame trailer and decrypts the body
-// using AES-CTR. The 8-byte SecureFrame tag is read but NOT verified — see
-// the security note on newDAVEDecryptCipher. Returns the plaintext media
-// bytes and the truncated nonce read from the frame so the caller can detect
-// generation rollover.
+// secureFrameParts holds the fields parsed from a SecureFrame trailer.
+// The 8-byte truncated tag is captured but not verified — see the security
+// note on newDAVEDecryptCipher.
+type secureFrameParts struct {
+	ciphertext []byte
+	nonce      uint32
+}
+
+// parseSecureFrame parses a DAVE SecureFrame trailer. Returns the
+// ciphertext slice (a sub-slice of encrypted) and the truncated nonce.
 //
 // Frame layout (per Discord DAVE spec, sequential from start of trailer):
 //
@@ -114,27 +119,27 @@ func decodeULEB128(data []byte) (value uint32, n int, err error) {
 //	[1B supplemental size] [0xFA 0xFA]
 //
 // The supplemental size byte counts the entire trailer length including
-// itself and the magic marker. Unencrypted range pairs are not supported by
-// this implementation — frames carrying any are rejected.
-func decryptSecureFrame(block cipher.Block, encrypted []byte) (plaintext []byte, nonce uint32, err error) {
+// itself and the magic marker. Unencrypted range pairs are not supported —
+// frames carrying any are rejected.
+func parseSecureFrame(encrypted []byte) (*secureFrameParts, error) {
 	const minTrailer = daveTagSize + 1 + 1 + 2 // tag + min ULEB128 + size byte + magic
 	if len(encrypted) < minTrailer {
-		return nil, 0, fmt.Errorf("frame too short: %d bytes", len(encrypted))
+		return nil, fmt.Errorf("frame too short: %d bytes", len(encrypted))
 	}
 
 	end := len(encrypted)
 	if encrypted[end-2] != 0xFA || encrypted[end-1] != 0xFA {
-		return nil, 0, fmt.Errorf("invalid magic marker: %02x %02x",
+		return nil, fmt.Errorf("invalid magic marker: %02x %02x",
 			encrypted[end-2], encrypted[end-1])
 	}
 
 	suppSize := int(encrypted[end-3])
 	if suppSize < minTrailer {
-		return nil, 0, fmt.Errorf("supplemental size %d below minimum trailer %d",
+		return nil, fmt.Errorf("supplemental size %d below minimum trailer %d",
 			suppSize, minTrailer)
 	}
 	if suppSize > end {
-		return nil, 0, fmt.Errorf("supplemental size %d exceeds frame size %d",
+		return nil, fmt.Errorf("supplemental size %d exceeds frame size %d",
 			suppSize, end)
 	}
 
@@ -143,30 +148,50 @@ func decryptSecureFrame(block cipher.Block, encrypted []byte) (plaintext []byte,
 
 	nonceVal, nonceLen, err := decodeULEB128(trailer[daveTagSize:])
 	if err != nil {
-		return nil, 0, fmt.Errorf("decoding nonce: %w", err)
+		return nil, fmt.Errorf("decoding nonce: %w", err)
 	}
 
 	rangesStart := daveTagSize + nonceLen
 	rangesEnd := len(trailer) - 3 // before size byte and magic
 	if rangesEnd < rangesStart {
-		return nil, 0, fmt.Errorf("malformed trailer: nonce overruns trailer")
+		return nil, fmt.Errorf("malformed trailer: nonce overruns trailer")
 	}
 	if rangesEnd > rangesStart {
-		return nil, 0, fmt.Errorf("unencrypted range pairs not supported (got %d trailing bytes)",
+		return nil, fmt.Errorf("unencrypted range pairs not supported (got %d trailing bytes)",
 			rangesEnd-rangesStart)
 	}
 
-	ciphertext := encrypted[:trailerStart]
+	return &secureFrameParts{
+		ciphertext: encrypted[:trailerStart],
+		nonce:      nonceVal,
+	}, nil
+}
 
-	// AES-GCM uses a CTR-mode keystream starting at J0+1, where
-	// J0 = IV || 0x00000001 for 12-byte IVs. Replicate that here.
-	iv := make([]byte, len(buildNonce(0))+4)
-	copy(iv, buildNonce(nonceVal))
+// aesCTRDecryptFrame XORs a SecureFrame ciphertext with the AES-CTR
+// keystream that AES-GCM would have produced for the given nonce.
+//
+// AES-GCM uses a CTR-mode keystream starting at J0+1, where J0 is the
+// IV || 0x00000001 for 12-byte IVs. We replicate that here so the
+// keystream byte-aligns with the encrypt path's GCM keystream.
+func aesCTRDecryptFrame(block cipher.Block, ciphertext []byte, nonce uint32) []byte {
+	iv := make([]byte, 16)
+	copy(iv, buildNonce(nonce))
 	binary.BigEndian.PutUint32(iv[12:], 2)
 
-	plaintext = make([]byte, len(ciphertext))
+	plaintext := make([]byte, len(ciphertext))
 	cipher.NewCTR(block, iv).XORKeyStream(plaintext, ciphertext)
-	return plaintext, nonceVal, nil
+	return plaintext
+}
+
+// decryptSecureFrame is the top-level helper used by tests and direct
+// callers. DAVESession.DecryptFrame uses parseSecureFrame +
+// aesCTRDecryptFrame directly so it can pick a per-generation cipher.
+func decryptSecureFrame(block cipher.Block, encrypted []byte) (plaintext []byte, nonce uint32, err error) {
+	parts, err := parseSecureFrame(encrypted)
+	if err != nil {
+		return nil, 0, err
+	}
+	return aesCTRDecryptFrame(block, parts.ciphertext, parts.nonce), parts.nonce, nil
 }
 
 func hashRatchetGetKey(baseSecret []byte, generation uint32) ([]byte, error) {

@@ -25,12 +25,34 @@ type DAVESession struct {
 	currentGeneration uint32
 	hasPendingKey     bool
 
+	// remoteSenders tracks decrypt state for other speakers in the group,
+	// keyed by user ID. Entries are created lazily on the first frame from
+	// each sender and reset on epoch transitions.
+	remoteSenders map[string]*daveRemoteSender
+
 	kpBundle *mlsKeyPackageBundle
+}
+
+// daveRemoteSender holds the receive-side ratchet state for one remote
+// member. We retain two generations (current and previous) so out-of-order
+// late frames from the prior generation still decrypt — per the DAVE spec,
+// keys remain valid for ~10 seconds across generation rollover.
+type daveRemoteSender struct {
+	userID            string
+	ratchetBaseSecret []byte
+
+	currentGen   uint32
+	currentBlock cipher.Block
+
+	prevGen   uint32
+	prevBlock cipher.Block
+	havePrev  bool
 }
 
 func NewDAVESession(userID string) *DAVESession {
 	return &DAVESession{
-		userID: userID,
+		userID:        userID,
+		remoteSenders: make(map[string]*daveRemoteSender),
 	}
 }
 
@@ -51,6 +73,7 @@ func (d *DAVESession) ResetForReWelcome() ([]byte, error) {
 	d.ratchetBaseSecret = nil
 	d.currentGeneration = 0
 	d.hasPendingKey = false
+	d.remoteSenders = make(map[string]*daveRemoteSender)
 
 	return d.generateKeyPackageLocked()
 }
@@ -142,6 +165,7 @@ func (d *DAVESession) HandlePrepareEpoch(epoch uint64, protocolVersion int) ([]b
 	d.senderKey = nil
 	d.frameCipher = nil
 	d.exporterSecret = nil
+	d.remoteSenders = make(map[string]*daveRemoteSender)
 
 	return d.generateKeyPackageLocked()
 }
@@ -237,4 +261,152 @@ func (d *DAVESession) Reset() {
 	d.ratchetBaseSecret = nil
 	d.currentGeneration = 0
 	d.hasPendingKey = false
+	d.remoteSenders = make(map[string]*daveRemoteSender)
+}
+
+// DecryptFrame decrypts a DAVE SecureFrame received from the named sender.
+// Returns the plaintext media bytes (typically Opus). The session must be
+// active (Welcome+ExecuteTransition completed); otherwise returns an error.
+//
+// Per-sender state is created lazily on the first frame from each sender
+// and reset on epoch transitions. The current and previous generation keys
+// are retained so out-of-order late frames from the prior generation still
+// decrypt — older generations are evicted on rollover.
+//
+// Tag verification is NOT performed; see security note on
+// newDAVEDecryptCipher. Wrong-key decryption produces garbage that the
+// downstream codec will fail to parse.
+func (d *DAVESession) DecryptFrame(senderUserID string, encrypted []byte) ([]byte, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if !d.active {
+		return nil, fmt.Errorf("DAVE session not active")
+	}
+	if d.exporterSecret == nil {
+		return nil, fmt.Errorf("no exporter secret")
+	}
+	if senderUserID == "" {
+		return nil, fmt.Errorf("empty sender user ID")
+	}
+
+	parts, err := parseSecureFrame(encrypted)
+	if err != nil {
+		return nil, fmt.Errorf("parse SecureFrame: %w", err)
+	}
+
+	sender, err := d.getOrCreateRemoteSenderLocked(senderUserID)
+	if err != nil {
+		return nil, fmt.Errorf("init sender %s: %w", senderUserID, err)
+	}
+
+	generation := parts.nonce >> 24
+	block, err := sender.blockForGeneration(generation)
+	if err != nil {
+		return nil, fmt.Errorf("derive key for generation %d: %w", generation, err)
+	}
+
+	return aesCTRDecryptFrame(block, parts.ciphertext, parts.nonce), nil
+}
+
+// getOrCreateRemoteSenderLocked returns the receive-side state for senderID,
+// creating and seeding the ratchet base secret on first use. Caller must
+// hold d.mu.
+func (d *DAVESession) getOrCreateRemoteSenderLocked(senderID string) (*daveRemoteSender, error) {
+	if d.remoteSenders == nil {
+		d.remoteSenders = make(map[string]*daveRemoteSender)
+	}
+	if s, ok := d.remoteSenders[senderID]; ok {
+		return s, nil
+	}
+
+	userIDNum, err := strconv.ParseUint(senderID, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("parsing sender user ID: %w", err)
+	}
+	context := make([]byte, 8)
+	binary.LittleEndian.PutUint64(context, userIDNum)
+
+	baseSecret, err := mlsExport(d.exporterSecret, daveExportLabel, context, daveKeySize)
+	if err != nil {
+		return nil, fmt.Errorf("exporting sender base secret: %w", err)
+	}
+
+	s := &daveRemoteSender{
+		userID:            senderID,
+		ratchetBaseSecret: baseSecret,
+	}
+	d.remoteSenders[senderID] = s
+	return s, nil
+}
+
+// blockForGeneration returns the AES block cipher for the given generation,
+// reusing the cached entry if present. Maintains a two-slot history
+// (current + previous) so out-of-order late frames still decrypt.
+// Generations older than previous are rejected, matching the DAVE spec's
+// ~10s key retention window in spirit (forward secrecy intent).
+func (s *daveRemoteSender) blockForGeneration(generation uint32) (cipher.Block, error) {
+	// Cold start: first frame from this sender.
+	if s.currentBlock == nil {
+		block, err := s.deriveBlock(generation)
+		if err != nil {
+			return nil, err
+		}
+		s.currentGen = generation
+		s.currentBlock = block
+		return block, nil
+	}
+
+	// Cache hits.
+	if generation == s.currentGen {
+		return s.currentBlock, nil
+	}
+	if s.havePrev && generation == s.prevGen {
+		return s.prevBlock, nil
+	}
+
+	// Forward jump: derive new, slide current → prev (evicting old prev).
+	if generation > s.currentGen {
+		block, err := s.deriveBlock(generation)
+		if err != nil {
+			return nil, err
+		}
+		s.prevGen = s.currentGen
+		s.prevBlock = s.currentBlock
+		s.havePrev = true
+		s.currentGen = generation
+		s.currentBlock = block
+		return block, nil
+	}
+
+	// Backward arrival exactly one generation old, prev slot empty (or
+	// caller forward-jumped past it). Fill the prev slot — within window.
+	if generation == s.currentGen-1 && !s.havePrev {
+		block, err := s.deriveBlock(generation)
+		if err != nil {
+			return nil, err
+		}
+		s.prevGen = generation
+		s.prevBlock = block
+		s.havePrev = true
+		return block, nil
+	}
+
+	// Older than two generations behind — reject per retention window.
+	return nil, fmt.Errorf("generation %d older than retained window (current=%d, prev=%d, havePrev=%t)",
+		generation, s.currentGen, s.prevGen, s.havePrev)
+}
+
+// deriveBlock computes the AES block cipher for a specific ratchet
+// generation from the sender's base secret.
+func (s *daveRemoteSender) deriveBlock(generation uint32) (cipher.Block, error) {
+	key, err := hashRatchetGetKey(s.ratchetBaseSecret, generation)
+	if err != nil {
+		return nil, fmt.Errorf("ratchet key for generation %d: %w", generation, err)
+	}
+	block, err := newDAVEDecryptCipher(key)
+	if err != nil {
+		return nil, fmt.Errorf("AES block for generation %d: %w", generation, err)
+	}
+	return block, nil
 }
