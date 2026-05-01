@@ -185,8 +185,13 @@ func (d *DAVESession) deriveSenderKeyLocked() error {
 	if err != nil {
 		return fmt.Errorf("parsing user ID: %w", err)
 	}
+	// User ID is encoded as big-endian uint64 to match the MLS credential
+	// identity (see dave_mls.go) and the SecureFrame spec, which uses
+	// network byte order for all binary integer contexts. Mismatching this
+	// against Discord clients yields a different base secret and produces
+	// garbage plaintext on decrypt.
 	context := make([]byte, 8)
-	binary.LittleEndian.PutUint64(context, userIDNum)
+	binary.BigEndian.PutUint64(context, userIDNum)
 
 	baseSecret, err := mlsExport(d.exporterSecret, daveExportLabel, context, daveKeySize)
 	if err != nil {
@@ -324,8 +329,9 @@ func (d *DAVESession) getOrCreateRemoteSenderLocked(senderID string) (*daveRemot
 	if err != nil {
 		return nil, fmt.Errorf("parsing sender user ID: %w", err)
 	}
+	// Big-endian to match the sender's encoding (see deriveSenderKeyLocked).
 	context := make([]byte, 8)
-	binary.LittleEndian.PutUint64(context, userIDNum)
+	binary.BigEndian.PutUint64(context, userIDNum)
 
 	baseSecret, err := mlsExport(d.exporterSecret, daveExportLabel, context, daveKeySize)
 	if err != nil {
