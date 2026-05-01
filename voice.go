@@ -1087,7 +1087,11 @@ func (v *VoiceConnection) opusReceiver(udpConn *net.UDPConn, close <-chan struct
 				}
 				decrypted, err := v.dave.DecryptFrame(senderID, plain)
 				if err != nil {
-					v.log(LogDebug, "DAVE decrypt failed ssrc=%d sender=%s: %s",
+					// Logged at warning level so production diagnostics see
+					// receive-side breakage without needing debug logging.
+					// In a healthy session this should fire at most a handful
+					// of times during epoch transitions / late frames.
+					v.log(LogWarning, "DAVE decrypt failed ssrc=%d sender=%s: %s",
 						p.SSRC, senderID, err)
 					continue
 				}
