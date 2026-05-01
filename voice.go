@@ -1094,16 +1094,22 @@ func (v *VoiceConnection) opusReceiver(udpConn *net.UDPConn, close <-chan struct
 				plain = plain[extPayloadBytes:]
 			}
 
-			// If DAVE E2EE is active for this connection, the post-transport
-			// payload is a SecureFrame from a remote sender; unwrap it to get
-			// the real Opus bytes. We need the SSRC -> user mapping populated
-			// by OP5 Speaking updates; if it isn't there yet, drop the frame.
-			if v.dave != nil && v.dave.IsActive() {
+			// Content-based SecureFrame detection: a DAVE SecureFrame always
+			// ends with the 0xFA 0xFA magic marker. We can't trust IsActive()
+			// alone — observed in production: handshake completes server-side
+			// but Discord still ships plain opus for non-mandatory channels,
+			// and even within an active DAVE session some packets may be
+			// non-SecureFrame (DTX, comfort-noise, transition windows). If
+			// the trailing bytes aren't the magic marker, treat the payload
+			// as plain opus and skip decrypt.
+			looksLikeSecureFrame := len(plain) >= 2 &&
+				plain[len(plain)-2] == 0xFA && plain[len(plain)-1] == 0xFA
+			if v.dave != nil && v.dave.IsActive() && looksLikeSecureFrame {
 				senderID, known := v.lookupUserBySSRC(p.SSRC)
 				if !known {
 					if v.markSSRCUnknownOnce(p.SSRC) {
 						v.log(LogWarning,
-							"DAVE: dropping packet with unmapped SSRC=%d (no OP5 Speaking event seen for this sender; further drops for this SSRC will be silent)",
+							"DAVE: dropping SecureFrame with unmapped SSRC=%d (no OP5 Speaking event seen for this sender; further drops for this SSRC will be silent)",
 							p.SSRC)
 					}
 					continue
