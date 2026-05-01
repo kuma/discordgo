@@ -87,15 +87,24 @@ type VoiceSpeakingUpdateHandler func(vc *VoiceConnection, vs *VoiceSpeakingUpdat
 
 // Speaking sends a speaking notification to Discord over the voice websocket.
 // This must be sent as true prior to sending audio and should be set to false
-// once finished sending audio.
+// once finished sending audio. Sending it at least once also subscribes the
+// connection to receive OP5 Speaking events for other participants — bots
+// that join purely as listeners and never call Speaking will not be
+// delivered Speaking events from the gateway.
 // b : Send true if speaking, false if not.
 func (v *VoiceConnection) Speaking(b bool) (err error) {
 
 	v.log(LogDebug, "called (%t)", b)
 
+	// Discord's voice gateway requires `ssrc` in the OP5 payload. The
+	// `speaking` field is also a bitmask (0 = not speaking, 1 = microphone,
+	// 2 = soundshare, 4 = priority), not a bool — but the bool form
+	// serializes to the right wire-format integers via the encoded mask
+	// below.
 	type voiceSpeakingData struct {
-		Speaking bool `json:"speaking"`
-		Delay    int  `json:"delay"`
+		Speaking int    `json:"speaking"`
+		Delay    int    `json:"delay"`
+		SSRC     uint32 `json:"ssrc"`
 	}
 
 	type voiceSpeakingOp struct {
@@ -107,7 +116,11 @@ func (v *VoiceConnection) Speaking(b bool) (err error) {
 		return fmt.Errorf("no VoiceConnection websocket")
 	}
 
-	data := voiceSpeakingOp{5, voiceSpeakingData{b, 0}}
+	speaking := 0
+	if b {
+		speaking = 1 // microphone bit
+	}
+	data := voiceSpeakingOp{5, voiceSpeakingData{speaking, 0, v.op2.SSRC}}
 	v.wsMutex.Lock()
 	err = v.wsConn.WriteJSON(data)
 	v.wsMutex.Unlock()
