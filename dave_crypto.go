@@ -4,6 +4,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"encoding/binary"
+	"fmt"
 )
 
 const (
@@ -61,6 +62,111 @@ func newDAVECipher(key []byte) (cipher.AEAD, error) {
 		return nil, err
 	}
 	return cipher.NewGCM(block)
+}
+
+// newDAVEDecryptCipher returns an AES block cipher for SecureFrame decryption.
+// Decryption uses AES-CTR (counter mode) rather than AES-GCM because the Go
+// standard library's cipher.NewGCMWithTagSize enforces a 12-byte minimum tag
+// size, while DAVE truncates GCM tags to 8 bytes.
+//
+// SECURITY NOTE: this approach skips inner SecureFrame tag verification.
+// Packet integrity is still guaranteed by the outer transport AEAD layer
+// (aead_aes256_gcm_rtpsize) that Discord's voice protocol applies before
+// DAVE. What's lost is end-to-end sender authenticity — i.e. proof that a
+// frame came from the claimed sender rather than the SFU. For a passive
+// recording use case where the SFU is trusted, this is acceptable. A
+// follow-up should add GHASH-based 8-byte tag verification for full DAVE
+// spec compliance.
+func newDAVEDecryptCipher(key []byte) (cipher.Block, error) {
+	return aes.NewCipher(key)
+}
+
+// decodeULEB128 reads a ULEB128 value from the start of data and returns the
+// value and number of bytes consumed. Capped at 5 bytes (max uint32 encoding).
+func decodeULEB128(data []byte) (value uint32, n int, err error) {
+	var result uint64
+	var shift uint
+	for i, b := range data {
+		if i >= 5 {
+			return 0, 0, fmt.Errorf("ULEB128 longer than 5 bytes")
+		}
+		result |= uint64(b&0x7F) << shift
+		if b&0x80 == 0 {
+			if result > 0xFFFFFFFF {
+				return 0, 0, fmt.Errorf("ULEB128 overflows uint32: %d", result)
+			}
+			return uint32(result), i + 1, nil
+		}
+		shift += 7
+	}
+	return 0, 0, fmt.Errorf("ULEB128 unterminated")
+}
+
+// decryptSecureFrame parses a DAVE SecureFrame trailer and decrypts the body
+// using AES-CTR. The 8-byte SecureFrame tag is read but NOT verified — see
+// the security note on newDAVEDecryptCipher. Returns the plaintext media
+// bytes and the truncated nonce read from the frame so the caller can detect
+// generation rollover.
+//
+// Frame layout (per Discord DAVE spec, sequential from start of trailer):
+//
+//	[ciphertext] [8B tag] [ULEB128 nonce] [ULEB128 unencrypted ranges]
+//	[1B supplemental size] [0xFA 0xFA]
+//
+// The supplemental size byte counts the entire trailer length including
+// itself and the magic marker. Unencrypted range pairs are not supported by
+// this implementation — frames carrying any are rejected.
+func decryptSecureFrame(block cipher.Block, encrypted []byte) (plaintext []byte, nonce uint32, err error) {
+	const minTrailer = daveTagSize + 1 + 1 + 2 // tag + min ULEB128 + size byte + magic
+	if len(encrypted) < minTrailer {
+		return nil, 0, fmt.Errorf("frame too short: %d bytes", len(encrypted))
+	}
+
+	end := len(encrypted)
+	if encrypted[end-2] != 0xFA || encrypted[end-1] != 0xFA {
+		return nil, 0, fmt.Errorf("invalid magic marker: %02x %02x",
+			encrypted[end-2], encrypted[end-1])
+	}
+
+	suppSize := int(encrypted[end-3])
+	if suppSize < minTrailer {
+		return nil, 0, fmt.Errorf("supplemental size %d below minimum trailer %d",
+			suppSize, minTrailer)
+	}
+	if suppSize > end {
+		return nil, 0, fmt.Errorf("supplemental size %d exceeds frame size %d",
+			suppSize, end)
+	}
+
+	trailerStart := end - suppSize
+	trailer := encrypted[trailerStart:end]
+
+	nonceVal, nonceLen, err := decodeULEB128(trailer[daveTagSize:])
+	if err != nil {
+		return nil, 0, fmt.Errorf("decoding nonce: %w", err)
+	}
+
+	rangesStart := daveTagSize + nonceLen
+	rangesEnd := len(trailer) - 3 // before size byte and magic
+	if rangesEnd < rangesStart {
+		return nil, 0, fmt.Errorf("malformed trailer: nonce overruns trailer")
+	}
+	if rangesEnd > rangesStart {
+		return nil, 0, fmt.Errorf("unencrypted range pairs not supported (got %d trailing bytes)",
+			rangesEnd-rangesStart)
+	}
+
+	ciphertext := encrypted[:trailerStart]
+
+	// AES-GCM uses a CTR-mode keystream starting at J0+1, where
+	// J0 = IV || 0x00000001 for 12-byte IVs. Replicate that here.
+	iv := make([]byte, len(buildNonce(0))+4)
+	copy(iv, buildNonce(nonceVal))
+	binary.BigEndian.PutUint32(iv[12:], 2)
+
+	plaintext = make([]byte, len(ciphertext))
+	cipher.NewCTR(block, iv).XORKeyStream(plaintext, ciphertext)
+	return plaintext, nonceVal, nil
 }
 
 func hashRatchetGetKey(baseSecret []byte, generation uint32) ([]byte, error) {
