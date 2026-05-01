@@ -76,8 +76,9 @@ type VoiceConnection struct {
 	// receive loop to pick the right per-sender DAVE key. The dedicated
 	// mutex avoids contention with the connection's main RWMutex held by
 	// other paths.
-	ssrcMu    sync.RWMutex
-	ssrcUsers map[uint32]string
+	ssrcMu             sync.RWMutex
+	ssrcUsers          map[uint32]string
+	ssrcUnknownLogged  map[uint32]bool
 }
 
 // VoiceSpeakingUpdateHandler type provides a function definition for the
@@ -254,6 +255,23 @@ func (v *VoiceConnection) lookupUserBySSRC(ssrc uint32) (string, bool) {
 	}
 	id, ok := v.ssrcUsers[ssrc]
 	return id, ok
+}
+
+// markSSRCUnknownOnce records that we've seen an unmapped SSRC and returns
+// true the first time per SSRC, false thereafter. Used by the receive loop
+// to log unmapped-SSRC drops once per SSRC instead of flooding for every
+// frame.
+func (v *VoiceConnection) markSSRCUnknownOnce(ssrc uint32) bool {
+	v.ssrcMu.Lock()
+	defer v.ssrcMu.Unlock()
+	if v.ssrcUnknownLogged == nil {
+		v.ssrcUnknownLogged = make(map[uint32]bool)
+	}
+	if v.ssrcUnknownLogged[ssrc] {
+		return false
+	}
+	v.ssrcUnknownLogged[ssrc] = true
+	return true
 }
 
 // VoiceSpeakingUpdate is a struct for a VoiceSpeakingUpdate event.
@@ -1083,6 +1101,11 @@ func (v *VoiceConnection) opusReceiver(udpConn *net.UDPConn, close <-chan struct
 			if v.dave != nil && v.dave.IsActive() {
 				senderID, known := v.lookupUserBySSRC(p.SSRC)
 				if !known {
+					if v.markSSRCUnknownOnce(p.SSRC) {
+						v.log(LogWarning,
+							"DAVE: dropping packet with unmapped SSRC=%d (no OP5 Speaking event seen for this sender; further drops for this SSRC will be silent)",
+							p.SSRC)
+					}
 					continue
 				}
 				decrypted, err := v.dave.DecryptFrame(senderID, plain)
