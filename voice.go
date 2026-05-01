@@ -70,6 +70,14 @@ type VoiceConnection struct {
 	op8 voiceOP8
 
 	voiceSpeakingUpdateHandlers []VoiceSpeakingUpdateHandler
+
+	// ssrcUsers maps an RTP SSRC to the Discord user ID currently bound to
+	// it. Populated as OP5 (Speaking) updates arrive and consumed by the
+	// receive loop to pick the right per-sender DAVE key. The dedicated
+	// mutex avoids contention with the connection's main RWMutex held by
+	// other paths.
+	ssrcMu    sync.RWMutex
+	ssrcUsers map[uint32]string
 }
 
 // VoiceSpeakingUpdateHandler type provides a function definition for the
@@ -222,6 +230,30 @@ func (v *VoiceConnection) AddHandler(h VoiceSpeakingUpdateHandler) {
 	defer v.Unlock()
 
 	v.voiceSpeakingUpdateHandlers = append(v.voiceSpeakingUpdateHandlers, h)
+}
+
+// setUserForSSRC records a mapping from an RTP SSRC to a user ID. Called
+// internally when an OP5 Speaking update arrives so the receive loop can
+// pick the right per-sender DAVE key for incoming frames.
+func (v *VoiceConnection) setUserForSSRC(ssrc uint32, userID string) {
+	v.ssrcMu.Lock()
+	defer v.ssrcMu.Unlock()
+	if v.ssrcUsers == nil {
+		v.ssrcUsers = make(map[uint32]string)
+	}
+	v.ssrcUsers[ssrc] = userID
+}
+
+// lookupUserBySSRC returns the user ID currently mapped to the given RTP
+// SSRC, if any. Used by the receive loop to select a per-sender DAVE key.
+func (v *VoiceConnection) lookupUserBySSRC(ssrc uint32) (string, bool) {
+	v.ssrcMu.RLock()
+	defer v.ssrcMu.RUnlock()
+	if v.ssrcUsers == nil {
+		return "", false
+	}
+	id, ok := v.ssrcUsers[ssrc]
+	return id, ok
 }
 
 // VoiceSpeakingUpdate is a struct for a VoiceSpeakingUpdate event.
@@ -568,14 +600,17 @@ func (v *VoiceConnection) onEvent(isBinary bool, message []byte) {
 		return
 
 	case 5:
-		if len(v.voiceSpeakingUpdateHandlers) == 0 {
-			return
-		}
-
 		voiceSpeakingUpdate := &VoiceSpeakingUpdate{}
 		if err := json.Unmarshal(e.RawData, voiceSpeakingUpdate); err != nil {
 			v.log(LogError, "OP5 unmarshall error, %s, %s", err, string(e.RawData))
 			return
+		}
+
+		// Track SSRC -> user mapping for DAVE receive-side decryption.
+		// We do this even if no user-supplied speaking handlers are
+		// registered, since the receive loop needs it.
+		if voiceSpeakingUpdate.UserID != "" && voiceSpeakingUpdate.SSRC != 0 {
+			v.setUserForSSRC(uint32(voiceSpeakingUpdate.SSRC), voiceSpeakingUpdate.UserID)
 		}
 
 		for _, h := range v.voiceSpeakingUpdateHandlers {
@@ -1040,6 +1075,25 @@ func (v *VoiceConnection) opusReceiver(udpConn *net.UDPConn, close <-chan struct
 				}
 				plain = plain[extPayloadBytes:]
 			}
+
+			// If DAVE E2EE is active for this connection, the post-transport
+			// payload is a SecureFrame from a remote sender; unwrap it to get
+			// the real Opus bytes. We need the SSRC -> user mapping populated
+			// by OP5 Speaking updates; if it isn't there yet, drop the frame.
+			if v.dave != nil && v.dave.IsActive() {
+				senderID, known := v.lookupUserBySSRC(p.SSRC)
+				if !known {
+					continue
+				}
+				decrypted, err := v.dave.DecryptFrame(senderID, plain)
+				if err != nil {
+					v.log(LogDebug, "DAVE decrypt failed ssrc=%d sender=%s: %s",
+						p.SSRC, senderID, err)
+					continue
+				}
+				plain = decrypted
+			}
+
 			p.Opus = plain
 		} else {
 			continue
