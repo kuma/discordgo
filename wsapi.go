@@ -739,6 +739,11 @@ func (s *Session) ChannelVoiceJoin(gID, cID string, mute, deaf bool) (voice *Voi
 	voice.deaf = deaf
 	voice.mute = mute
 	voice.session = s
+	// Inherit the session's log level so voice diagnostics (DAVE decrypt
+	// failures, unmapped-SSRC drops, OP4/OP5 trace, etc.) are visible at
+	// whatever level the embedding application chose. Without this, the
+	// voice connection defaults to LogError and silences anything below.
+	voice.LogLevel = s.LogLevel
 	voice.Unlock()
 
 	err = s.ChannelVoiceJoinManual(gID, cID, mute, deaf)
