@@ -225,10 +225,13 @@ func (v *VoiceConnection) AddHandler(h VoiceSpeakingUpdateHandler) {
 }
 
 // VoiceSpeakingUpdate is a struct for a VoiceSpeakingUpdate event.
+//
+// Speaking is a bitmask: 1 = microphone, 2 = soundshare, 4 = priority.
+// 0 means the user stopped speaking. Multiple flags may be combined.
 type VoiceSpeakingUpdate struct {
 	UserID   string `json:"user_id"`
 	SSRC     int    `json:"ssrc"`
-	Speaking bool   `json:"speaking"`
+	Speaking int    `json:"speaking"`
 }
 
 // ------------------------------------------------------------------------------------------------
